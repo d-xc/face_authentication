@@ -1,0 +1,158 @@
+#!/usr/bin/env python
+
+import os
+import cv2
+import openface
+import argparse
+import time
+import pickle
+import numpy as np
+import rospy
+from std_msgs.msg import Int8
+from sklearn.mixture import GMM
+
+fileDir = os.path.dirname(os.path.realpath(__file__))
+dataDir = os.path.join(fileDir, '..', 'data') 
+modelDir = os.path.join(dataDir, 'models')
+
+def getRep(rgbImg, multiple=False):
+    start = time.time()
+
+    if multiple:
+        bbs = align.getAllFaceBoundingBoxes(rgbImg)
+    else:
+        bb1 = align.getLargestFaceBoundingBox(rgbImg)
+        bbs = [bb1]
+    if len(bbs) == 0 or (not multiple and bb1 is None):
+        print("Unable to find a face")
+    if args.verbose:
+        print("Face detection took {} seconds.".format(time.time() - start))
+
+    reps = []
+    for bb in bbs:
+        start = time.time()
+        alignedFace = align.align(
+            args.imgDim,
+            rgbImg,
+            bb,
+            landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
+        if alignedFace is None:
+            print("Unable to align image")
+        if args.verbose:
+            print("Alignment took {} seconds.".format(time.time() - start))
+            print("This bbox is centered at {}, {}".format(bb.center().x, bb.center().y))
+
+        start = time.time()
+        rep = net.forward(alignedFace)
+        if args.verbose:
+            print("Neural network forward pass took {} seconds.".format(
+                time.time() - start))
+        reps.append((bb.center().x, rep))
+    sreps = sorted(reps, key=lambda x: x[0])
+    return sreps
+
+def train(args):
+    pass
+
+def infer(args, multiple, rgbImg, le, clf):
+    reps = getRep(rgbImg, multiple)
+    if len(reps) > 1:
+        print("List of faces in image from left to right")
+    for r in reps:
+        rep = r[1].reshape(1, -1)
+        bbx = r[0]
+        start = time.time()
+        predictions = clf.predict_proba(rep).ravel()
+        maxI = np.argmax(predictions)
+        person = le.inverse_transform(maxI)
+        confidence = predictions[maxI]
+        if args.verbose:
+            print("Prediction took {} seconds.".format(time.time() - start))
+        if multiple:
+            print("Predict {} @ x={} with {:.2f} confidence.".format(person, bbx,
+                                                                         confidence))
+        else:
+            print("Predict {} with {:.2f} confidence.".format(person, confidence))
+        if isinstance(clf, GMM):
+            dist = np.linalg.norm(rep - clf.means_[maxI])
+            print("+ Distance from the mean: {}".format(dist))             
+    return person, confidence
+
+if __name__ == '__main__':
+    
+    rospy.init_node('face_auth', anonymous=True)
+    pub = rospy.Publisher('face/auth', Int8, queue_size=5)
+    rate = rospy.Rate(10)
+    
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument('--dlibFacePredictor', 
+                        type=str, 
+                        help="Path to dlib's face predictor.",
+                        default=os.path.join(modelDir, 'dlib', 'shape_predictor_68_face_landmarks.dat'))
+    parser.add_argument('--networkModel',
+                         type=str,
+                         help="Path to Torch network model.",
+                         default=os.path.join(modelDir, 'openface', 'nn4.small2.v1.t7'))
+    parser.add_argument('--classifierModel',
+                             type=str,
+                             help='The Python pickle representing the classifier. This is NOT the Torch network model, which can be set with --networkModel.',
+                             default=os.path.join(dataDir, 'classifier.pkl'))
+    parser.add_argument('--imgDim', type=int,
+                        help="Default image dimension.", default=96)
+    parser.add_argument('--cuda', action='store_true')
+    parser.add_argument('--multi', help="Infer multiple faces in image", action="store_true", default=False)
+    parser.add_argument('--verbose', action='store_true')
+    
+    args = parser.parse_args()   
+    
+    start = time.time()
+    align = openface.AlignDlib(args.dlibFacePredictor)
+    net = openface.TorchNeuralNet(args.networkModel, imgDim=args.imgDim, cuda=args.cuda)
+    if args.verbose:
+        print("Loading the dlib and OpenFace models took {} seconds.".format(
+            time.time() - start))
+        start = time.time()
+
+    cap = cv2.VideoCapture(0)
+    
+    #open the classifierModel
+    with open(args.classifierModel, 'r') as f:
+        (le, clf) = pickle.load(f) 
+      
+    #authentication flag
+    autherizedFlag = 0  
+    while not rospy.is_shutdown():
+        ret, bgrImg = cap.read()
+        rgbImg = cv2.cvtColor(bgrImg, cv2.COLOR_BGR2RGB)
+        bb = align.getLargestFaceBoundingBox(rgbImg)
+        if bb == None:
+            if args.verbose:
+                print("No face is found in this frame.")
+        else:
+            if args.verbose:
+                print("Face locates at(top={}, bottom={}, left={}, right={})").format(bb.top(),bb.bottom(),bb.left(),bb.right())
+            bl = (bb.left(),bb.bottom())
+            tr = (bb.right(), bb.top())
+            cv2.rectangle(bgrImg, bl, tr, color=(153, 255, 204),thickness=3)
+            person, confidence = infer(args, args.multi, rgbImg, le, clf)
+            if confidence > 0.8:
+                autherizedFlag= 1
+            else:
+                autherizedFlag = 0
+            pub.publish(autherizedFlag)
+              
+        cv2.imshow('frame', bgrImg)
+        
+        rate.sleep()
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        
+    # When everything done, release the capture
+    cap.release()
+    cv2.destroyAllWindows()
+
+    
+
+
